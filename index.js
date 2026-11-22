@@ -1,6 +1,6 @@
 'use strict'
 
-const { normalizeIPv6, normalizeIPv4, removeDotSegments, removeDotSegmentsRelative, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, escapePreservingEscapes, reescapeHostDelimiters } = require('./lib/utils')
+const { normalizeIPv6, normalizeIPv4, removeDotSegments, removeDotSegmentsRelative, escapeFirstSegmentColon, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, escapePreservingEscapes, reescapeHostDelimiters } = require('./lib/utils')
 const SCHEMES = require('./lib/schemes')
 
 const MALFORMED_HOST_ERROR = 'URI host is malformed.'
@@ -181,12 +181,24 @@ function serialize (cmpts, opts) {
   // perform scheme specific serialization
   if (schemeHandler && schemeHandler.serialize) schemeHandler.serialize(components, options)
 
+  const authority = recomposeAuthority(components)
+  // A reference with no emitted scheme is path-noscheme: a bare ':' in its
+  // first path segment would reparse as a scheme (RFC 3986 3.3/4.2). A suffix
+  // reference never emits its scheme token, so it is path-noscheme as well.
+  // Only an authority that is actually emitted protects the path. Enforced
+  // under skipEscape too (resolve()), so the reapply below gates on this flag.
+  const schemelessReference = (!components.scheme || options.reference === 'suffix') && authority === undefined
+  const pathNoScheme = !options.skipEscape && schemelessReference
+
   if (components.path !== undefined) {
     if (!options.skipEscape) {
       components.path = escapePreservingEscapes(components.path)
 
       if (components.scheme !== undefined) {
         components.path = components.path.split('%3A').join(':')
+      }
+      if (pathNoScheme) {
+        components.path = escapeFirstSegmentColon(components.path)
       }
     } else {
       components.path = normalizePercentEncoding(components.path)
@@ -199,7 +211,6 @@ function serialize (cmpts, opts) {
     uriTokens.push(components.scheme, ':')
   }
 
-  const authority = recomposeAuthority(components)
   if (authority !== undefined) {
     if (options.reference !== 'suffix') {
       uriTokens.push('//')
@@ -219,9 +230,17 @@ function serialize (cmpts, opts) {
       // and must never become root-relative (RFC 3986 section 5.2.4 applies to
       // merged target paths, not to the reference itself). A reference with no
       // emitted scheme and no authority is such a relative-path reference.
-      s = (options.reference === 'suffix' || !components.scheme) && authority === undefined && s.charAt(0) !== '/'
+      s = schemelessReference && s.charAt(0) !== '/'
         ? removeDotSegmentsRelative(s)
         : removeDotSegments(s)
+    }
+
+    // Dot-segment removal can expose a colon that was not originally in the
+    // first segment, and skipEscape or absolutePath can leave one raw. Reapply
+    // path-noscheme encoding so the serialized relative reference cannot be
+    // reparsed as a URI scheme.
+    if (schemelessReference) {
+      s = escapeFirstSegmentColon(s)
     }
 
     if (authority === undefined) {
@@ -371,6 +390,18 @@ function getParseError (parsed, matches) {
   return undefined
 }
 
+function hasSuffixAuthority (uri) {
+  const authorityEnd = uri.search(/[/?#]/)
+  const authority = authorityEnd === -1 ? uri : uri.slice(0, authorityEnd)
+  const at = authority.lastIndexOf('@')
+  const hostPort = authority.slice(at + 1)
+
+  if (hostPort[0] === '[') return true
+
+  const colon = hostPort.lastIndexOf(':')
+  return colon === -1 || /^\d*$/u.test(hostPort.slice(colon + 1))
+}
+
 function parseWithStatus (uri, opts) {
   const options = Object.assign({}, opts)
   const parsed = {
@@ -388,7 +419,17 @@ function parseWithStatus (uri, opts) {
   let malformedIPLiteral = false
   let malformedScheme = false
   let isIP = false
-  if (options.reference === 'suffix') uri = (options.scheme ? options.scheme + ':' : '') + '//' + uri
+  if (options.reference === 'suffix') {
+    if (options.scheme) {
+      // Suffix references traditionally omit both the scheme and the "//"
+      // authority marker. Preserve that interpretation for valid authorities,
+      // but treat a non-numeric host-port suffix as a path. Otherwise inputs
+      // such as "javascript:alert(1)" are emitted as live schemes.
+      uri = options.scheme + (hasSuffixAuthority(uri) ? '://' : ':') + uri
+    } else {
+      uri = '//' + uri
+    }
+  }
 
   // A literal backslash (U+005C) is not a valid RFC 3986 URI character and is
   // not an authority delimiter. Reject it in the authority rather than
