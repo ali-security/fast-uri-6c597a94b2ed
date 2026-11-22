@@ -235,6 +235,7 @@ function canonicalizeHost (parsed, options, schemeHandler, isIP) {
     !options.unicodeSupport &&
     (!schemeHandler || !schemeHandler.unicodeSupport) &&
     parsed.host &&
+    !isIPLiteral(parsed.host) &&
     (options.domainHost || (schemeHandler && schemeHandler.domainHost)) &&
     isIP === false &&
     nonSimpleDomain(parsed.host)
@@ -336,6 +337,7 @@ function parseWithStatus (uri, opts) {
   const gotEncoding = uri.indexOf('%') !== -1
   let malformedAuthorityOrPort = false
   let malformedHost = false
+  let malformedIPLiteral = false
   let isIP = false
   if (options.reference === 'suffix') uri = (options.scheme ? options.scheme + ':' : '') + '//' + uri
 
@@ -400,9 +402,19 @@ function parseWithStatus (uri, opts) {
     if (parsed.host) {
       const ipv4result = normalizeIPv4(parsed.host)
       if (ipv4result.isIPV4 === false) {
-        const ipv6result = normalizeIPv6(ipv4result.host)
-        parsed.host = ipv6result.host.toLowerCase()
-        isIP = ipv6result.isIPV6
+        const bracketedIPLiteral = isIPLiteral(parsed.host)
+        const ipv6result = normalizeIPv6(parsed.host)
+        isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true
+        malformedIPLiteral = bracketedIPLiteral && ipv6result.error === true
+        parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase()
+
+        if (malformedIPLiteral) {
+          // A bracketed IP literal that does not parse must be rejected, not
+          // rewritten: silently truncating or re-encoding it hands back a
+          // different, valid-looking authority than the one that was supplied.
+          parsed.error = parsed.error || MALFORMED_HOST_ERROR
+          malformedAuthorityOrPort = true
+        }
       } else {
         parsed.host = ipv4result.host
         isIP = true
@@ -439,8 +451,11 @@ function parseWithStatus (uri, opts) {
       // and hide raw delimiters behind re-escaping, so resolve() could not
       // reject them for domain-host schemes. The resolved authority is decoded
       // and re-escaped when it is serialized.
-      if (gotEncoding && parsed.host !== undefined && (isIP || options.scheme !== 'null')) {
-        parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP)
+      // A validated IP literal is already normalized (its zone identifier keeps
+      // its percent-encoded octets), and a malformed one is kept verbatim.
+      if (gotEncoding && parsed.host !== undefined && !malformedIPLiteral && (isIP || options.scheme !== 'null')) {
+        const host = isIP ? parsed.host : unescape(parsed.host)
+        parsed.host = reescapeHostDelimiters(host, isIP)
       }
       if (parsed.path) {
         parsed.path = escape(unescape(parsed.path))
