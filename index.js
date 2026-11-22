@@ -3,6 +3,12 @@
 const { normalizeIPv6, normalizeIPv4, removeDotSegments, recomposeAuthority, normalizeComponentEncoding, reescapeHostDelimiters } = require('./lib/utils')
 const SCHEMES = require('./lib/schemes')
 
+const MALFORMED_HOST_ERROR = 'URI host is malformed.'
+// ASCII characters outside the RFC 3986 reg-name set (unreserved, sub-delims
+// and "%" for pct-encoded): C0 controls, space, DEL, and "#/:<>?@[\]^`{|}.
+const FORBIDDEN_DOMAIN_HOST_CHARACTER = /[\0-\x20"#/:<>?@[\\\]^`{|}\x7F]/u
+const NON_ASCII_CHARACTER = /[^\0-\x7F]/u
+
 function normalize (uri, options) {
   if (typeof uri === 'string') {
     uri = normalizeString(uri, options)
@@ -15,6 +21,25 @@ function normalize (uri, options) {
 function resolve (baseURI, relativeURI, options) {
   const schemelessOptions = Object.assign({ scheme: 'null' }, options)
   const resolved = resolveComponents(parse(baseURI, schemelessOptions), parse(relativeURI, schemelessOptions), schemelessOptions, true)
+  const resolvedSchemeHandler = SCHEMES[((options && options.scheme) || resolved.scheme || '').toLowerCase()]
+  const resolvedHost = resolved.host
+  const resolvedHostIsIP = resolvedHost !== undefined && resolvedHost !== '' &&
+    (normalizeIPv4(resolvedHost).isIPV4 || normalizeIPv6(resolvedHost).isIPV6)
+  // Inputs are parsed scheme-neutrally, so delimiters and controls in a domain
+  // host are only detected here, once the final scheme is known. They always
+  // fail closed, including in percent-encoded hosts.
+  if (hasForbiddenDomainHost(resolved, options || {}, resolvedSchemeHandler, resolvedHostIsIP)) {
+    throw new Error(MALFORMED_HOST_ERROR)
+  }
+  canonicalizeHost(resolved, options || {}, resolvedSchemeHandler, resolvedHostIsIP)
+  // Percent escapes in an ASCII reg-name are encoded data. The WHATWG hostname
+  // parser can reject them even though fast-uri preserves them safely as RFC
+  // 3986 data. A raw non-ASCII host must still fail closed if conversion fails.
+  const encodedASCIIHost = resolvedHost && resolvedHost.indexOf('%') !== -1 &&
+    !NON_ASCII_CHARACTER.test(resolvedHost)
+  if (resolved.error && !encodedASCIIHost) {
+    throw new Error(resolved.error)
+  }
   return serialize(resolved, { ...schemelessOptions, skipEscape: true })
 }
 
@@ -176,6 +201,95 @@ function nonSimpleDomain (value) {
   return false
 }
 
+/**
+ * @param {string} host
+ * @returns {boolean} whether the host is a bracketed IP literal
+ */
+function isIPLiteral (host) {
+  return host[0] === '[' && host[host.length - 1] === ']'
+}
+
+/**
+ * Convert a Unicode/IDN domain host to the ASCII form the WHATWG URL parser
+ * (and therefore `fetch()`) would use, when the effective scheme uses domain
+ * hosts.
+ *
+ * @param {import('./types/index').URIComponent} parsed
+ * @param {import('./types/index').Options} options
+ * @param {{ domainHost?: boolean, unicodeSupport?: boolean }|undefined} schemeHandler
+ * @param {boolean} isIP
+ * @returns {boolean} whether host conversion failed
+ */
+function canonicalizeHost (parsed, options, schemeHandler, isIP) {
+  if (hasForbiddenDomainHost(parsed, options, schemeHandler, isIP)) {
+    parsed.error = parsed.error || MALFORMED_HOST_ERROR
+    return true
+  }
+
+  if (
+    !options.unicodeSupport &&
+    (!schemeHandler || !schemeHandler.unicodeSupport) &&
+    parsed.host &&
+    (options.domainHost || (schemeHandler && schemeHandler.domainHost)) &&
+    isIP === false &&
+    nonSimpleDomain(parsed.host)
+  ) {
+    let url
+    try {
+      url = new URL('http://' + parsed.host)
+    } catch (e) {
+      parsed.error = parsed.error || "Host's domain name can not be converted to ASCII: " + e
+      return true
+    }
+    // The WHATWG parser must have read the whole input as a host. Anything
+    // else means it found a delimiter fast-uri did not, so its hostname would
+    // describe a different authority.
+    if (!isHostOnlyURL(url)) {
+      parsed.error = parsed.error || MALFORMED_HOST_ERROR
+      return true
+    }
+    parsed.host = url.hostname
+  }
+  return false
+}
+
+/**
+ * Whether a domain host contains an ASCII character that RFC 3986 does not
+ * allow in a reg-name (unreserved, sub-delims, or pct-encoded). Such a host is
+ * rejected instead of being handed to the WHATWG URL parser, which would treat
+ * "@" as a userinfo delimiter (silently dropping the data before it) and strip
+ * TAB, LF, and CR. Non-ASCII characters remain allowed for IDNs.
+ *
+ * @param {import('./types/index').URIComponent} parsed
+ * @param {import('./types/index').Options} options
+ * @param {{ domainHost?: boolean }|undefined} schemeHandler
+ * @param {boolean} isIP
+ * @returns {boolean}
+ */
+function hasForbiddenDomainHost (parsed, options, schemeHandler, isIP) {
+  return Boolean(
+    parsed.host &&
+    isIP === false &&
+    !isIPLiteral(parsed.host) &&
+    (options.domainHost || (schemeHandler && schemeHandler.domainHost)) &&
+    FORBIDDEN_DOMAIN_HOST_CHARACTER.test(parsed.host)
+  )
+}
+
+/**
+ * @param {URL} url
+ * @returns {boolean}
+ */
+function isHostOnlyURL (url) {
+  return url.username === '' &&
+    url.password === '' &&
+    url.port === '' &&
+    url.pathname === '/' &&
+    url.search === '' &&
+    url.hash === '' &&
+    url.hostname !== ''
+}
+
 const URI_PARSE = /^(?:([^#/:?]+):)?(?:\/\/((?:([^#/?@]*)@)?(\[[^#/?\]]+\]|[^#/:?]*)(?::(\d*))?))?([^#?]*)(?:\?([^#]*))?(?:#((?:.|[\n\r])*))?/u
 
 function getParseError (parsed, matches) {
@@ -203,6 +317,7 @@ function parseWithStatus (uri, opts) {
   }
   const gotEncoding = uri.indexOf('%') !== -1
   let malformedAuthorityOrPort = false
+  let malformedHost = false
   let isIP = false
   if (options.reference === 'suffix') uri = (options.scheme ? options.scheme + ':' : '') + '//' + uri
 
@@ -258,25 +373,20 @@ function parseWithStatus (uri, opts) {
     // find scheme handler
     const schemeHandler = SCHEMES[(options.scheme || parsed.scheme || '').toLowerCase()]
 
-    // check if scheme can't handle IRIs
-    if (!options.unicodeSupport && (!schemeHandler || !schemeHandler.unicodeSupport)) {
-      // if host component is a domain name
-      if (parsed.host && (options.domainHost || (schemeHandler && schemeHandler.domainHost)) && isIP === false && nonSimpleDomain(parsed.host)) {
-        // convert Unicode IDN -> ASCII IDN
-        try {
-          parsed.host = URL.domainToASCII(parsed.host.toLowerCase())
-        } catch (e) {
-          parsed.error = parsed.error || "Host's domain name can not be converted to ASCII: " + e
-        }
-      }
-      // convert IRI -> URI
-    }
+    // convert Unicode IDN -> ASCII IDN when the effective scheme uses domain hosts
+    malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
 
     if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
       if (gotEncoding && parsed.scheme !== undefined) {
         parsed.scheme = unescape(parsed.scheme)
       }
-      if (gotEncoding && parsed.host !== undefined) {
+      // Resolution parses both inputs with the internal `null` scheme before
+      // the effective scheme is known. Keep a reg-name host percent-encoded for
+      // that step: decoding it here would turn encoded delimiters into raw ones
+      // and hide raw delimiters behind re-escaping, so resolve() could not
+      // reject them for domain-host schemes. The resolved authority is decoded
+      // and re-escaped when it is serialized.
+      if (gotEncoding && parsed.host !== undefined && (isIP || options.scheme !== 'null')) {
         parsed.host = reescapeHostDelimiters(unescape(parsed.host), isIP)
       }
       if (parsed.path) {
@@ -298,7 +408,7 @@ function parseWithStatus (uri, opts) {
   } else {
     parsed.error = parsed.error || 'URI can not be parsed.'
   }
-  return { parsed, malformedAuthorityOrPort }
+  return { parsed, malformedAuthorityOrPort, malformedHost }
 }
 
 function parse (uri, opts) {
@@ -306,16 +416,16 @@ function parse (uri, opts) {
 }
 
 function normalizeString (uri, opts) {
-  const { parsed, malformedAuthorityOrPort } = parseWithStatus(uri, opts)
-  // a malformed authority or port must never be canonicalized into a
+  const { parsed, malformedAuthorityOrPort, malformedHost } = parseWithStatus(uri, opts)
+  // a malformed authority, host or port must never be canonicalized into a
   // different, valid URI: hand the input back untouched
-  return malformedAuthorityOrPort ? uri : serialize(parsed, opts)
+  return malformedAuthorityOrPort || malformedHost ? uri : serialize(parsed, opts)
 }
 
 function normalizeComparableURI (uri, opts) {
   if (typeof uri === 'string') {
-    const { parsed, malformedAuthorityOrPort } = parseWithStatus(uri, opts)
-    return malformedAuthorityOrPort ? undefined : serialize(normalizeComponentEncoding(parsed, true), { ...opts, skipEscape: true })
+    const { parsed, malformedAuthorityOrPort, malformedHost } = parseWithStatus(uri, opts)
+    return malformedAuthorityOrPort || malformedHost ? undefined : serialize(normalizeComponentEncoding(parsed, true), { ...opts, skipEscape: true })
   }
 
   if (typeof uri === 'object') {
