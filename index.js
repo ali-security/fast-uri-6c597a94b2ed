@@ -552,19 +552,31 @@ function parseWithStatus (uri, opts) {
     // convert Unicode IDN -> ASCII IDN when the effective scheme uses domain hosts
     malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
 
-    if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
+    // Host normalization runs for every scheme, including those that skip
+    // path normalization, so an encoded host spelling cannot differ from the
+    // literal one.
+    // A validated IP literal is already normalized (its zone identifier keeps
+    // its percent-encoded octets), and a malformed one is kept verbatim.
+    if (gotEncoding && parsed.host !== undefined && !malformedIPLiteral) {
+      // Decode only current unreserved escapes, once. Using unescape() here
+      // decodes every escape and lets a nested escape (e.g. %252e -> %2e -> .)
+      // reparse as a live delimiter, redirecting to a different host.
+      let host = isIP ? parsed.host : normalizePercentEncoding(parsed.host, true)
+      if (!isIP) {
+        // Fold reg-name case after decoding unreserved octets. The second
+        // pass only restores uppercase hex in escapes that remain encoded.
+        host = normalizePercentEncoding(host.toLowerCase())
+      }
       // Resolution parses both inputs with the internal `null` scheme before
       // the effective scheme is known. Keep a reg-name host percent-encoded for
-      // that step: decoding it here would turn encoded delimiters into raw ones
-      // and hide raw delimiters behind re-escaping, so resolve() could not
-      // reject them for domain-host schemes. The resolved authority is decoded
-      // and re-escaped when it is serialized.
-      // A validated IP literal is already normalized (its zone identifier keeps
-      // its percent-encoded octets), and a malformed one is kept verbatim.
-      if (gotEncoding && parsed.host !== undefined && !malformedIPLiteral && (isIP || options.scheme !== 'null')) {
-        const host = isIP ? parsed.host : unescape(parsed.host)
-        parsed.host = reescapeHostDelimiters(host, isIP)
-      }
+      // that step: re-escaping here would hide raw delimiters, so resolve()
+      // could not reject them for domain-host schemes. Only unreserved octets
+      // were decoded above, so no encoded delimiter has become a raw one. The
+      // resolved authority is re-escaped when it is serialized.
+      parsed.host = isIP || options.scheme !== 'null' ? reescapeHostDelimiters(host, isIP) : host
+    }
+
+    if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
       if (parsed.path) {
         parsed.path = normalizePathEncoding(parsed.path)
       }
